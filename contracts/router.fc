@@ -1,0 +1,190 @@
+#include "imports/stdlib.fc";
+#include "imports/consts.fc";
+
+(slice, int, int, cell, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+    slice fees = ds~load_ref().begin_parse();
+    slice protocol_fee_destination = fees~load_msg_addr();
+    int protocol_fee_percent = fees~load_uint(8);
+    int owner_fee_percent = fees~load_uint(8);
+    slice codes = ds~load_ref().begin_parse();
+    cell user_contract_code = codes~load_ref();
+    cell follower_contract_code = codes~load_ref();
+    ds.end_parse();
+
+    return (protocol_fee_destination, protocol_fee_percent, owner_fee_percent, user_contract_code, follower_contract_code);
+}
+
+() save_data(slice protocol_fee_destination, int protocol_fee_percent, int owner_fee_percent, cell user_contract_code, cell follower_contract_code) impure inline {
+    builder db = begin_cell()
+                .store_ref(begin_cell()
+                          .store_slice(protocol_fee_destination)
+                          .store_uint(protocol_fee_percent, 8)
+                          .store_uint(owner_fee_percent, 8)
+                          .end_cell())
+                .store_ref(begin_cell()
+                          .store_ref(user_contract_code)
+                          .store_ref(follower_contract_code)
+                          .end_cell());
+    
+    set_data(db.end_cell());
+}
+
+(slice, cell) calculate_user_address_and_state_init(slice user_wallet_address) inline {
+    (slice protocol_fee_destination, int protocol_fee_percent, int owner_fee_percent, cell user_contract_code, cell follower_contract_code) = load_data();
+
+    cell initial_data = begin_cell()
+                        .store_slice(my_address()) ;; router_address
+                        .store_slice(user_wallet_address) ;; owner_address
+                        .store_uint(0, 256) ;; total_shares
+                        .store_ref(begin_cell()
+                                    .store_slice(protocol_fee_destination)
+                                    .store_uint(protocol_fee_percent, 8)
+                                    .store_uint(owner_fee_percent, 8)
+                                    .end_cell())
+                        .store_ref(follower_contract_code)
+                        .end_cell();
+
+    cell state_init = begin_cell()
+                      .store_uint(0, 2)
+                      .store_dict(user_contract_code)
+                      .store_dict(initial_data)
+                      .store_uint(0, 1)
+                      .end_cell();
+
+    slice user_address = begin_cell()
+                                  .store_uint(4, 3)
+                                  .store_int(0, 8) ;; workchain
+                                  .store_uint(cell_hash(state_init), 256)
+                                  .end_cell()
+                                  .begin_parse();
+
+    return (user_address, state_init);
+}
+
+(slice, cell) calculate_follower_address_and_state_init(slice user_wallet_address, slice follower_wallet_address) inline {
+    (slice protocol_fee_destination, int protocol_fee_percent, int owner_fee_percent, cell user_contract_code, cell follower_contract_code) = load_data();
+
+    (slice user_address, _) = calculate_user_address_and_state_init(user_wallet_address);
+
+    cell initial_data = begin_cell()
+                        .store_ref(begin_cell()
+                                   .store_slice(my_address()) ;; router_address
+                                   .store_slice(user_address)
+                                   .store_slice(follower_wallet_address)
+                                   .end_cell())
+                        .store_uint(0, 256) ;; initial my_shares
+                        .end_cell();
+
+    cell state_init = begin_cell()
+                      .store_uint(0, 2)
+                      .store_dict(follower_contract_code)
+                      .store_dict(initial_data)
+                      .store_uint(0, 1)
+                      .end_cell();
+
+    slice follower_address = begin_cell()
+                                  .store_uint(4, 3)
+                                  .store_int(0, 8) ;; workchain
+                                  .store_uint(cell_hash(state_init), 256)
+                                  .end_cell()
+                                  .begin_parse();
+
+    return (follower_address, state_init);
+}
+
+() buy_shares(slice user_wallet_address, slice follower_wallet_address, int shares_number) impure inline {
+    (slice user_address, cell state_init) = calculate_user_address_and_state_init(user_wallet_address);
+
+    cell msg_body = begin_cell()
+                    .store_uint(OP::BUY_SHARES(), 32)
+                    .store_uint(0 , 64)
+                    .store_slice(follower_wallet_address)
+                    .store_uint(shares_number, 256)
+                    .end_cell();
+
+    cell msg_full = begin_cell()
+                    .store_uint(0x18, 6)
+                    .store_slice(user_address)
+                    .store_coins(0)
+                    .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+                    .store_ref(state_init)
+                    .store_ref(msg_body)
+                    .end_cell();
+    
+    send_raw_message(msg_full, MODE::CARRY_REMAINING_FROM_INBOUND());
+}
+
+() sell_shares(slice user_wallet_address, slice follower_wallet_address, int shares_number) impure inline {
+    (slice follower_address, cell state_init) = calculate_follower_address_and_state_init(user_wallet_address, follower_wallet_address);
+
+    cell msg_body = begin_cell()
+                    .store_uint(OP::SELL_SHARES(), 32)
+                    .store_uint(0 , 64)
+                    .store_uint(shares_number, 256)
+                    .end_cell();
+
+    cell msg_full = begin_cell()
+                    .store_uint(0x18, 6)
+                    .store_slice(follower_address)
+                    .store_coins(0)
+                    .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+                    .store_ref(state_init)
+                    .store_ref(msg_body)
+                    .end_cell();
+    
+    send_raw_message(msg_full, MODE::CARRY_REMAINING_FROM_INBOUND());
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; deploy handler
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { ;; bounced message handler
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    if(op == OP::BUY_SHARES()) { ;; deploy new user or buy shares
+        throw_unless(ERROR::NOT_ENOUGH_TON_TO_PAY_FOR_BUY_INITIAL_GAS(), msg_value >= FEE::BUY_INITIAL_GAS());
+        slice follower_wallet_address = sender_address;
+        slice user_wallet_address = in_msg_body~load_msg_addr();
+        int shares_number = in_msg_body~load_uint(256);
+        throw_unless(ERROR::INVALID_SHARES_NUMBER(), shares_number > 0);
+        buy_shares(user_wallet_address, follower_wallet_address, shares_number);
+        return ();
+    }
+
+    if(op == OP::SELL_SHARES()) { ;; sell shares
+        throw_unless(ERROR::NOT_ENOUGH_TON_TO_PAY_FOR_SELL_INITIAL_GAS(), msg_value >= FEE::SELL_INITIAL_GAS());
+        slice follower_wallet_address = sender_address;
+        slice user_wallet_address = in_msg_body~load_msg_addr();
+        int shares_number = in_msg_body~load_uint(256);
+        throw_unless(ERROR::INVALID_SHARES_NUMBER(), shares_number > 0);
+        sell_shares(user_wallet_address, follower_wallet_address, shares_number);
+        return ();
+    }
+    
+    throw(0xffff);
+}
+
+(slice) get_user_address(slice user_wallet_address) method_id {
+    (slice user_address, _) = calculate_user_address_and_state_init(user_wallet_address);
+    return user_address;
+}
+
+(slice) get_follower_address(slice user_wallet_address, slice follower_wallet_address) method_id {
+    (slice follower_address, _) = calculate_follower_address_and_state_init(user_wallet_address, follower_wallet_address);
+    return follower_address;
+}
+
+(slice, int, int) get_fee_data() method_id {
+    (slice protocol_fee_destination, int protocol_fee_percent, int owner_fee_percent, cell user_contract_code, cell follower_contract_code) = load_data();
+    return (protocol_fee_destination, protocol_fee_percent, owner_fee_percent);
+}
