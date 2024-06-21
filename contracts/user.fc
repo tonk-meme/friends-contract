@@ -210,7 +210,7 @@
 (int) get_buy_price(int shares_number) method_id {
     (slice router_address, slice user_wallet_address, int total_shares, slice protocol_fee_destination, int protocol_fee_percent, int owner_fee_percent, cell follower_contract_code) = load_data();
     int shares_price = calculate_price(total_shares, shares_number);
-    return (shares_price * (100 + protocol_fee_percent + owner_fee_percent)) / 100 + FEE::CALCULATION_FEE();
+    return (shares_price * (100 + protocol_fee_percent + owner_fee_percent)) / 100 + 2 * FEE::CALCULATION_FEE();
 }
 
 (int) get_sell_price(int shares_number) method_id {
